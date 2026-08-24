@@ -237,6 +237,19 @@ export const init = memoize(async (): Promise<void> => {
       })
     }
 
+    // Surface ripgrep fallback (e.g. Android/Termux) once per session.
+    // Goes to stderr so it doesn't corrupt pipe-mode (`-p`) stdout.
+    try {
+      const { getRipgrepStatus } = await import('../utils/ripgrep.js')
+      const status = getRipgrepStatus()
+      if (status.note) {
+        process.stderr.write(`[ripgrep] ${status.note}\n`)
+      }
+    } catch {
+      // Ripgrep status is best-effort; never block init.
+      logForDebugging('[init] ripgrep status check skipped')
+    }
+
     logForDiagnosticsNoPII('info', 'init_completed', {
       duration_ms: Date.now() - initStartTime,
     })
@@ -317,6 +330,16 @@ export function initializeTelemetryAfterTrust(): void {
 async function doInitializeTelemetry(): Promise<void> {
   if (telemetryInitialized) {
     // Already initialized, nothing to do
+    return
+  }
+
+  // Skip entire OTel initialization when telemetry is not enabled.
+  // Prevents PerformanceMeasure accumulation in long-running sessions.
+  if (!isEnvTruthy(process.env.CLAUDE_CODE_ENABLE_TELEMETRY)) {
+    telemetryInitialized = true
+    logForDebugging(
+      '[3P telemetry] Skipped — CLAUDE_CODE_ENABLE_TELEMETRY not set',
+    )
     return
   }
 

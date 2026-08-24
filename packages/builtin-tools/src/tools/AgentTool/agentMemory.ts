@@ -1,9 +1,6 @@
 import { join, normalize, sep } from 'path'
 import { getProjectRoot } from 'src/bootstrap/state.js'
-import {
-  buildMemoryPrompt,
-  ensureMemoryDirExists,
-} from 'src/memdir/memdir.js'
+import { buildMemoryPrompt, ensureMemoryDirExists } from 'src/memdir/memdir.js'
 import { getMemoryBaseDir } from 'src/memdir/paths.js'
 import { getCwd } from 'src/utils/cwd.js'
 import { findCanonicalGitRoot } from 'src/utils/git.js'
@@ -101,16 +98,6 @@ export function isAgentMemoryPath(absolutePath: string): boolean {
   }
 
   return false
-}
-
-/**
- * Returns the agent memory file path for a given agent type and scope.
- */
-export function getAgentMemoryEntrypoint(
-  agentType: string,
-  scope: AgentMemoryScope,
-): string {
-  return join(getAgentMemoryDir(agentType, scope), 'MEMORY.md')
 }
 
 export function getMemoryScopeDisplay(

@@ -10,7 +10,21 @@ import {
   getSessionId,
   isSessionPersistenceDisabled,
 } from '../bootstrap/state.js'
-import { DISABLE_KITTY_KEYBOARD, DISABLE_MODIFY_OTHER_KEYS, DBP, DFE, DISABLE_MOUSE_TRACKING, EXIT_ALT_SCREEN, SHOW_CURSOR, CLEAR_ITERM2_PROGRESS, CLEAR_TAB_STATUS, CLEAR_TERMINAL_TITLE, instances, supportsTabStatus, wrapForMultiplexer } from '@anthropic/ink'
+import {
+  DISABLE_KITTY_KEYBOARD,
+  DISABLE_MODIFY_OTHER_KEYS,
+  DBP,
+  DFE,
+  DISABLE_MOUSE_TRACKING,
+  EXIT_ALT_SCREEN,
+  SHOW_CURSOR,
+  CLEAR_ITERM2_PROGRESS,
+  CLEAR_TAB_STATUS,
+  CLEAR_TERMINAL_TITLE,
+  instances,
+  supportsTabStatus,
+  wrapForMultiplexer,
+} from '@anthropic/ink'
 import { shutdownDatadog } from '../services/analytics/datadog.js'
 import { shutdown1PEventLogging } from '../services/analytics/firstPartyEventLogger.js'
 import {
@@ -155,9 +169,7 @@ function printResumeHint(): void {
 
       writeSync(
         1,
-        chalk.dim(
-          `\nResume this session with:\nclaude --resume ${resumeArg}\n`,
-        ),
+        chalk.dim(`\nResume this session with:\nccb --resume ${resumeArg}\n`),
       )
       resumeHintPrinted = true
     } catch {
@@ -486,7 +498,11 @@ export async function gracefulShutdown(
   // Lost analytics on slow networks are acceptable; a hanging exit is not.
   try {
     await Promise.race([
-      Promise.all([shutdown1PEventLogging(), shutdownDatadog(), closeSentry(2000)]),
+      Promise.all([
+        shutdown1PEventLogging(),
+        shutdownDatadog(),
+        closeSentry(2000),
+      ]),
       sleep(500),
     ])
   } catch {

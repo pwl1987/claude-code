@@ -112,7 +112,6 @@ import type {
   ModelInfo,
   SDKMessage,
   SDKUserMessage,
-  SDKUserMessageReplay,
   PermissionResult,
   McpServerConfigForProcessTransport,
   McpServerStatus,
@@ -186,7 +185,7 @@ import {
   logSuggestionSuppressed,
   type PromptVariant,
 } from 'src/services/PromptSuggestion/promptSuggestion.js'
-import { getLastCacheSafeParams } from 'src/utils/forkedAgent.js'
+import { getLastCacheSafeParams } from 'src/utils/cacheSafeParamsSlot.js'
 import { getAccountInformation } from 'src/utils/auth.js'
 import { OAuthService } from 'src/services/oauth/index.js'
 import { installOAuthTokens } from 'src/cli/handlers/auth.js'
@@ -378,9 +377,6 @@ const cronJitterConfigModule =
   require('../utils/cronJitterConfig.js') as typeof import('../utils/cronJitterConfig.js')
 const cronGate =
   require('@claude-code-best/builtin-tools/tools/ScheduleCronTool/prompt.js') as typeof import('@claude-code-best/builtin-tools/tools/ScheduleCronTool/prompt.js')
-const extractMemoriesModule = feature('EXTRACT_MEMORIES')
-  ? (require('../services/extractMemories/extractMemories.js') as typeof import('../services/extractMemories/extractMemories.js'))
-  : null
 /* eslint-enable @typescript-eslint/no-require-imports */
 
 const SHUTDOWN_TEAM_PROMPT = `<system-reminder>
@@ -551,9 +547,19 @@ export async function runHeadless(
     proactiveModule.activateProactive('command')
   }
 
-  // Periodically force a full GC to keep memory usage in check
+  // Periodically run GC to keep memory usage in check.
+  // Uses a memory threshold to trigger a forced (major) GC when RSS grows
+  // beyond 350MB — the incremental GC may not reclaim enough during peaks
+  // (compact, long sessions with many mounted DOM nodes).
   if (typeof Bun !== 'undefined') {
-    const gcTimer = setInterval(Bun.gc, 1000)
+    const gcTimer = setInterval(() => {
+      const rss = process.memoryUsage.rss()
+      if (rss > 350 * 1024 * 1024) {
+        Bun.gc(true)
+      } else {
+        Bun.gc(false)
+      }
+    }, 1000)
     gcTimer.unref()
   }
 
@@ -951,14 +957,18 @@ export async function runHeadless(
           writeToStdout(`Execution error`)
           break
         case 'error_max_turns':
-          writeToStdout(`Error: Reached max turns (${options.maxTurns})`)
+          writeToStdout(
+            `Error: Reached max turns (${options.maxTurns}).\nTip: Increase the limit with --max-turns or continue in a new session.`,
+          )
           break
         case 'error_max_budget_usd':
-          writeToStdout(`Error: Exceeded USD budget (${options.maxBudgetUsd})`)
+          writeToStdout(
+            `Error: Exceeded USD budget ($${options.maxBudgetUsd}).\nTip: Increase the limit with --max-budget-usd or start a new session to continue.`,
+          )
           break
         case 'error_max_structured_output_retries':
           writeToStdout(
-            `Error: Failed to provide valid structured output after maximum retries`,
+            `Error: Failed to provide valid structured output after maximum retries.\nTip: Simplify your schema or check if the output format matches the expected structure.`,
           )
       }
   }
@@ -972,7 +982,14 @@ export async function runHeadless(
   // the forked agent mid-flight. Gated by isExtractModeActive so the
   // tengu_slate_thimble flag controls non-interactive extraction end-to-end.
   if (feature('EXTRACT_MEMORIES') && isExtractModeActive()) {
-    await extractMemoriesModule!.drainPendingExtraction()
+    try {
+      const { drainPendingExtraction } = await import(
+        '../services/extractMemories/extractMemories.js'
+      )
+      await drainPendingExtraction()
+    } catch {
+      // Module load failure — non-critical at shutdown
+    }
   }
 
   gracefulShutdownSync(
@@ -4949,7 +4966,7 @@ function handleChannelEnable(
   // channel messages queue at priority 'next' and are seen by the model on
   // the turn after they arrive.
   connection.client.setNotificationHandler(
-    ChannelMessageNotificationSchema(),
+    ChannelMessageNotificationSchema() as any,
     async notification => {
       const { content, meta } = notification.params
       logMCPDebug(
@@ -5025,7 +5042,7 @@ function reregisterChannelHandlerAfterReconnect(
     'Channel notifications re-registered after reconnect',
   )
   connection.client.setNotificationHandler(
-    ChannelMessageNotificationSchema(),
+    ChannelMessageNotificationSchema() as any,
     async notification => {
       const { content, meta } = notification.params
       logMCPDebug(
@@ -5463,7 +5480,7 @@ function getStructuredIO(
  */
 export async function handleOrphanedPermissionResponse({
   message,
-  setAppState,
+  setAppState: _setAppState,
   onEnqueued,
   handledToolUseIds,
 }: {

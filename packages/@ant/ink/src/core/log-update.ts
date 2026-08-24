@@ -28,6 +28,11 @@ import {
   setScrollRegion,
 } from './termio/csi.js'
 import { LINK_END, link as oscLink } from './termio/osc.js'
+import {
+  isLegacyWindowsConsole,
+  legacyConsoleMode,
+  legacyConsoleResetMs,
+} from './legacyConsole.js'
 
 type State = {
   previousOutput: string
@@ -43,6 +48,8 @@ const NEWLINE = { type: 'stdout', content: '\n' } as const
 
 export class LogUpdate {
   private state: State
+  // Timestamp of the last legacy-console full reset (see render()).
+  private lastLegacyReset = 0
 
   constructor(private readonly options: Options) {
     this.state = {
@@ -67,7 +74,7 @@ export class LogUpdate {
     const { screen } = frame
     const lines: string[] = []
     let currentStyles: AnsiCode[] = []
-    let currentHyperlink: Hyperlink = undefined
+    let currentHyperlink: Hyperlink
     for (let y = 0; y < screen.height; y++) {
       let line = ''
       for (let x = 0; x < screen.width; x++) {
@@ -145,6 +152,23 @@ export class LogUpdate {
       (prev.viewport.width !== 0 && next.viewport.width !== prev.viewport.width)
     ) {
       return fullResetSequence_CAUSES_FLICKER(next, 'resize', stylePool)
+    }
+
+    // Legacy Windows console (pre-ConPTY, build < 17763): the old conhost
+    // VT parser drifts on incremental cursor diffs (pending-wrap semantics
+    // at the last column), so residue accumulates until a full repaint.
+    // Replace the diff with a full reset — every frame in 'always' mode
+    // (machines where each diff corrupts immediately), otherwise on a
+    // configurable interval so the screen self-heals. Gated off everywhere
+    // else; see legacyConsole.ts.
+    if (isLegacyWindowsConsole()) {
+      if (
+        legacyConsoleMode() === 'always' ||
+        startTime - this.lastLegacyReset >= legacyConsoleResetMs()
+      ) {
+        this.lastLegacyReset = startTime
+        return fullResetSequence_CAUSES_FLICKER(next, 'clear', stylePool)
+      }
     }
 
     // DECSTBM scroll optimization: when a ScrollBox's scrollTop changed,
@@ -301,7 +325,7 @@ export class LogUpdate {
         cursorRestoreScroll
 
     let currentStyleId = stylePool.none
-    let currentHyperlink: Hyperlink = undefined
+    let currentHyperlink: Hyperlink
 
     // First pass: render changes to existing rows (rows < prev.screen.height)
     let needsFullReset = false
@@ -533,7 +557,7 @@ function renderFrameSlice(
   stylePool: StylePool,
 ): VirtualScreen {
   let currentStyleId = stylePool.none
-  let currentHyperlink: Hyperlink = undefined
+  let currentHyperlink: Hyperlink
   // Track the styleId of the last rendered cell on this line (-1 if none).
   // Passed to visibleCellAtIndex to enable fg-only space optimization.
   let lastRenderedStyleId = -1

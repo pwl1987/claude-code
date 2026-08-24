@@ -244,7 +244,14 @@ import {
   formatCommandInputTags,
 } from '../utils/messages.js';
 import { generateSessionTitle } from '../utils/sessionTitle.js';
-import { BASH_INPUT_TAG, COMMAND_MESSAGE_TAG, COMMAND_NAME_TAG, LOCAL_COMMAND_STDOUT_TAG } from '../constants/xml.js';
+import {
+  BASH_INPUT_TAG,
+  COMMAND_MESSAGE_TAG,
+  COMMAND_NAME_TAG,
+  FORK_BOILERPLATE_TAG,
+  LOCAL_COMMAND_STDOUT_TAG,
+} from '../constants/xml.js';
+import { FORK_SUBAGENT_TYPE } from '@claude-code-best/builtin-tools/tools/AgentTool/forkSubagent.js';
 import { escapeXml } from '../utils/xml.js';
 import type { ThinkingConfig } from '../utils/thinking.js';
 import { gracefulShutdownSync } from '../utils/gracefulShutdown.js';
@@ -270,7 +277,7 @@ import { useManagePlugins } from '../hooks/useManagePlugins.js';
 import { Messages } from '../components/Messages.js';
 import { TaskListV2 } from '../components/TaskListV2.js';
 import { TeammateViewHeader } from '../components/TeammateViewHeader.js';
-import { getPipeDisplayRole, getPipeIpc, isPipeControlled } from '../utils/pipeTransport.js';
+import { getPipeIpc } from '../utils/pipeTransport.js';
 import { useTasksV2WithCollapseEffect } from '../hooks/useTasksV2.js';
 import { maybeMarkProjectOnboardingComplete } from '../projectOnboardingState.js';
 import type { MCPServerConnection } from '../services/mcp/types.js';
@@ -305,8 +312,9 @@ import {
 import { deserializeMessages } from '../utils/conversationRecovery.js';
 import { extractReadFilesFromMessages, extractBashToolsFromMessages } from '../utils/queryHelpers.js';
 import { resetMicrocompactState } from '../services/compact/microCompact.js';
-import { runPostCompactCleanup } from '../services/compact/postCompactCleanup.js';
+import { runPostCompactCleanup, registerCompactCleanup } from '../services/compact/postCompactCleanup.js';
 import {
+  createContentReplacementState,
   provisionContentReplacementState,
   reconstructContentReplacementState,
   type ContentReplacementRecord,
@@ -335,6 +343,7 @@ import {
 import { isBgSession, updateSessionName, updateSessionActivity } from '../utils/concurrentSessions.js';
 import { isInProcessTeammateTask, type InProcessTeammateTaskState } from '../tasks/InProcessTeammateTask/types.js';
 import { restoreRemoteAgentTasks } from '../tasks/RemoteAgentTask/RemoteAgentTask.js';
+import { BackgroundAgentSelector } from '../components/tasks/BackgroundAgentSelector.js';
 import { useInboxPoller } from '../hooks/useInboxPoller.js';
 // Dead code elimination: conditional import for loop mode
 /* eslint-disable @typescript-eslint/no-require-imports */
@@ -346,6 +355,9 @@ const SUGGEST_BG_PR_NOOP = (_p: string, _n: string): boolean => false;
 const useProactive =
   feature('PROACTIVE') || feature('KAIROS') ? require('../proactive/useProactive.js').useProactive : null;
 const useScheduledTasks = feature('AGENT_TRIGGERS') ? require('../hooks/useScheduledTasks.js').useScheduledTasks : null;
+const useGoalContinuation: typeof import('../hooks/useGoalContinuation.js').useGoalContinuation | null = feature('GOAL')
+  ? require('../hooks/useGoalContinuation.js').useGoalContinuation
+  : null;
 const useMasterMonitor = feature('UDS_INBOX')
   ? require('../hooks/useMasterMonitor.js').useMasterMonitor
   : () => undefined;
@@ -437,6 +449,8 @@ import { useLspPluginRecommendation } from 'src/hooks/useLspPluginRecommendation
 import { LspRecommendationMenu } from 'src/components/LspRecommendation/LspRecommendationMenu.js';
 import { useClaudeCodeHintRecommendation } from 'src/hooks/useClaudeCodeHintRecommendation.js';
 import { PluginHintMenu } from 'src/components/ClaudeCodeHint/PluginHintMenu.js';
+import { SearchExtraToolsHint } from 'src/components/SearchExtraToolsHint.js';
+import { useSearchExtraToolsHint } from 'src/hooks/useSearchExtraToolsHint.js';
 import {
   DesktopUpsellStartup,
   shouldShowDesktopUpsellStartup,
@@ -799,6 +813,21 @@ export type Props = {
 
 export type Screen = 'prompt' | 'transcript';
 
+// Boilerplate carrier lives in a mixed user message ([tool_result..., text])
+// that AgentTool/forkSubagent.buildForkedMessages emits as the fork child's
+// first user turn. The text block wraps <FORK_BOILERPLATE_TAG>...</..> + the
+// user prompt; tool_result siblings keep the parent's tool calls closed.
+const FORK_BOILERPLATE_OPEN_TAG = `<${FORK_BOILERPLATE_TAG}>`;
+
+function isForkBoilerplateTextBlock(block: { type: string; text?: string }): boolean {
+  return block.type === 'text' && typeof block.text === 'string' && block.text.includes(FORK_BOILERPLATE_OPEN_TAG);
+}
+
+function isForkBoilerplateMessage(message: MessageType): boolean {
+  if (message.type !== 'user' || !Array.isArray(message.message?.content)) return false;
+  return message.message.content.some(isForkBoilerplateTextBlock);
+}
+
 export function REPL({
   commands: initialCommands,
   debug,
@@ -807,8 +836,8 @@ export function REPL({
   pendingHookMessages,
   initialFileHistorySnapshots,
   initialContentReplacements,
-  initialAgentName,
-  initialAgentColor,
+  initialAgentName: _initialAgentName,
+  initialAgentColor: _initialAgentColor,
   mcpClients: initialMcpClients,
   dynamicMcpConfig: initialDynamicMcpConfig,
   autoConnectIdeFlag,
@@ -836,9 +865,8 @@ export function REPL({
     [],
   );
   const disableVirtualScroll = useMemo(() => isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL), []);
-  const disableMessageActions = feature('MESSAGE_ACTIONS')
-    ? useMemo(() => isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_MESSAGE_ACTIONS), [])
-    : false;
+  const disableMessageActionsRaw = useMemo(() => isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_MESSAGE_ACTIONS), []);
+  const disableMessageActions = feature('MESSAGE_ACTIONS') ? disableMessageActionsRaw : false;
 
   // Log REPL mount/unmount lifecycle
   useEffect(() => {
@@ -1013,6 +1041,7 @@ export function REPL({
   useTeammateLifecycleNotification();
   const { recommendation: lspRecommendation, handleResponse: handleLspResponse } = useLspPluginRecommendation();
   const { recommendation: hintRecommendation, handleResponse: handleHintResponse } = useClaudeCodeHintRecommendation();
+  const searchExtraToolsHint = useSearchExtraToolsHint();
 
   // Memoize the combined initial tools array to prevent reference changes
   const combinedInitialTools = useMemo(() => {
@@ -1106,6 +1135,24 @@ export function REPL({
   // REPL bridge to abort the active query when a remote interrupt arrives.
   const abortControllerRef = useRef<AbortController | null>(null);
   abortControllerRef.current = abortController;
+
+  // Timestamp (ms) of the most recent local-jsx panel dismissal (e.g. ESC on
+  // /workflows). Used by onCancel's grace-period guard: the ESC that closes
+  // a local-jsx panel (or any quick follow-up ESC within the grace window)
+  // must not fall through to abortController.abort('user-cancel') — otherwise
+  // closing the /workflows panel via ESC would kill the in-flight Workflow
+  // tool. The chat:cancel keybinding's isActive gate (`!isLocalJSXCommand`)
+  // only shields the panel while it's mounted; once React commits the
+  // unmount, the next ESC reaches onCancel unguarded. This ref closes that
+  // race without touching keybinding registration order.
+  const LOCAL_JSX_CLOSE_CANCEL_GRACE_MS = 500;
+  const localJSXClosedAtRef = useRef(0);
+
+  // Track whether the last turn was user-aborted (Ctrl+C / Escape).
+  // When true, useGoalContinuation skips the continuation enqueue so
+  // interrupted turns don't spin into an unstoppable loop. Reset to
+  // false at the start of the next user-initiated turn.
+  const [wasAborted, setWasAborted] = useState(false);
 
   // Ref for the bridge result callback — set after useReplBridge initializes,
   // read in the onQuery finally block to notify mobile clients that a turn ended.
@@ -1320,6 +1367,9 @@ export function REPL({
         if (args?.clearLocalJSX) {
           localJSXCommandRef.current = null;
           setToolJSXInternal(null);
+          // Stamp the dismissal so onCancel's grace-period guard can swallow
+          // the ESC that just dismissed the panel (and any quick follow-up).
+          localJSXClosedAtRef.current = Date.now();
           return;
         }
         // Otherwise, keep the local JSX command visible - ignore tool updates
@@ -1528,14 +1578,13 @@ export function REPL({
   // KAIROS build + config.viewerOnly. feature() is build-time constant so
   // the branch is dead-code-eliminated in non-KAIROS builds (same pattern
   // as useUnseenDivider above).
-  const { maybeLoadOlder } = feature('KAIROS')
-    ? useAssistantHistory({
-        config: remoteSessionConfig,
-        setMessages,
-        scrollRef,
-        onPrepend: shiftDivider,
-      })
-    : HISTORY_STUB;
+  const assistantHistoryResult = useAssistantHistory({
+    config: remoteSessionConfig,
+    setMessages,
+    scrollRef,
+    onPrepend: shiftDivider,
+  });
+  const { maybeLoadOlder } = feature('KAIROS') ? assistantHistoryResult : HISTORY_STUB;
   // Compose useUnseenDivider's callbacks with the lazy-load trigger.
   const composedOnScroll = useCallback(
     (sticky: boolean, handle: ScrollBoxHandle) => {
@@ -1565,7 +1614,15 @@ export function REPL({
   // Deferred messages for the Messages component — renders at transition
   // priority so the reconciler yields every 5ms, keeping input responsive
   // while the expensive message processing pipeline runs.
-  const deferredMessages = useDeferredValue(messages);
+  // Cap at 500 messages to limit memory double-buffering. The bypass
+  // at display-time uses sync messages during streaming and non-loading,
+  // so this cap only affects reduced-motion scenarios.
+  const DEFERRED_CAP = 500;
+  const cappedMessages = React.useMemo(
+    () => (messages.length > DEFERRED_CAP ? messages.slice(-DEFERRED_CAP) : messages),
+    [messages],
+  );
+  const deferredMessages = useDeferredValue(cappedMessages);
   const deferredBehind = messages.length - deferredMessages.length;
   if (deferredBehind > 0) {
     logForDebugging(
@@ -1693,6 +1750,7 @@ export function REPL({
   // Ref instead of state to avoid triggering React re-renders on every
   // streaming text_delta. The spinner reads this via its animation timer.
   const responseLengthRef = useRef(0);
+  const compactProgressActiveRef = useRef(false);
   // API performance metrics ref for ant-only spinner display (TTFT/OTPS).
   // Accumulates metrics from all API requests in a turn for P50 aggregation.
   const apiMetricsRef = useRef<
@@ -1778,6 +1836,9 @@ export function REPL({
   const [contentReplacementStateRef] = useState(() => ({
     current: provisionContentReplacementState(initialMessages, initialContentReplacements),
   }));
+  registerCompactCleanup(() => {
+    contentReplacementStateRef.current = createContentReplacementState();
+  });
 
   const [haveShownCostDialog, setHaveShownCostDialog] = useState(getGlobalConfig().hasAcknowledgedCostThreshold);
   const [vimMode, setVimMode] = useState<VimMode>('INSERT');
@@ -2184,6 +2245,16 @@ export function REPL({
         // cached name and write it to the wrong transcript on first message.
         clearSessionMetadata();
         restoreSessionMetadata(log);
+
+        // Hydrate goal state from the resumed session's transcript
+        if (feature('GOAL') && log.goal) {
+          const { hydrateGoalFromTranscript } =
+            require('../services/goal/goalStorage.js') as typeof import('../services/goal/goalStorage.js');
+          const goalsMap = new Map<UUID, import('../types/logs.js').GoalState>();
+          goalsMap.set(sessionId as UUID, log.goal);
+          hydrateGoalFromTranscript(goalsMap, sessionId as UUID);
+        }
+
         // Resumed sessions shouldn't re-title from mid-conversation context
         // (same reasoning as the useRef seed), and the previous session's
         // Haiku title shouldn't carry over.
@@ -2358,6 +2429,7 @@ export function REPL({
     | 'remote-callout'
     | 'lsp-recommendation'
     | 'plugin-hint'
+    | 'search-extra-tools-hint'
     | 'desktop-upsell'
     | 'ultraplan-choice'
     | 'ultraplan-launch'
@@ -2411,6 +2483,9 @@ export function REPL({
 
     // Plugin hint from CLI/SDK stderr (same priority band as LSP rec)
     if (allowDialogsWithAnimation && hintRecommendation) return 'plugin-hint';
+
+    // Tool search hint (discovered tools relevant to current query)
+    if (allowDialogsWithAnimation && searchExtraToolsHint.visible) return 'search-extra-tools-hint';
 
     // Desktop app upsell (max 3 launches, lowest priority)
     if (allowDialogsWithAnimation && showDesktopUpsellStartup) return 'desktop-upsell';
@@ -2475,6 +2550,24 @@ export function REPL({
       return;
     }
 
+    // Grace-period guard: if a local-jsx panel (e.g. /workflows) was just
+    // dismissed via ESC, swallow the same / immediately-following ESC so it
+    // doesn't fall through to abortController.abort('user-cancel') and kill
+    // the in-flight Workflow tool. Single-press ESC closes the panel
+    // (handled by the panel's own useInput → onDone → setToolJSX); the
+    // chat:cancel keybinding's isActive gate shields while the panel is
+    // mounted but not in the React commit window right after unmount.
+    // Reset the stamp so a later, deliberate ESC still cancels normally.
+    if (
+      localJSXClosedAtRef.current !== 0 &&
+      Date.now() - localJSXClosedAtRef.current < LOCAL_JSX_CLOSE_CANCEL_GRACE_MS
+    ) {
+      localJSXClosedAtRef.current = 0;
+      logForDebugging('[onCancel] suppressed: local-jsx panel just dismissed');
+      return;
+    }
+    localJSXClosedAtRef.current = 0;
+
     logForDebugging(`[onCancel] focusedInputDialog=${focusedInputDialog} streamMode=${streamMode}`);
 
     // Pause proactive mode so the user gets control back.
@@ -2482,6 +2575,24 @@ export function REPL({
     if (feature('PROACTIVE') || feature('KAIROS')) {
       proactiveModule?.pauseProactive();
     }
+
+    // Ctrl+C during an active goal turn pauses the goal so the
+    // continuation loop stops. The user can /goal resume to continue later.
+    // Guard: only pause when a query is actually in flight. onCancel() is
+    // also called from the restore/edit flow (idle), and pausing then would
+    // incorrectly stop the next continuation.
+    if (feature('GOAL') && queryGuard.getSnapshot()) {
+      const { getGoal, pauseGoal } =
+        require('../services/goal/goalState.js') as typeof import('../services/goal/goalState.js');
+      const { persistCurrentGoal } =
+        require('../services/goal/goalStorage.js') as typeof import('../services/goal/goalStorage.js');
+      const currentGoal = getGoal();
+      if (currentGoal?.status === 'active') {
+        pauseGoal();
+        persistCurrentGoal();
+      }
+    }
+    setWasAborted(true);
 
     queryGuard.forceEnd();
     skipIdleCheckRef.current = false;
@@ -2785,7 +2896,7 @@ export function REPL({
   const getToolUseContext = useCallback(
     (
       messages: MessageType[],
-      newMessages: MessageType[],
+      _newMessages: MessageType[],
       abortController: AbortController,
       mainLoopModel: string,
     ): ProcessUserInputContext => {
@@ -2901,11 +3012,13 @@ export function REPL({
               break;
             case 'compact_start':
               setSpinnerMessage('Compacting conversation');
+              compactProgressActiveRef.current = true;
               break;
             case 'compact_end':
               setSpinnerMessage(null);
               setSpinnerColor(null);
               setSpinnerShimmerColor(null);
+              compactProgressActiveRef.current = false;
               break;
           }
         },
@@ -3120,6 +3233,43 @@ export function REPL({
               proactiveModule?.setContextBlocked(true);
             } else if (newMessage.type === 'assistant') {
               proactiveModule?.setContextBlocked(false);
+            }
+          }
+          // Auto-pause active /goal when the turn failed due to connectivity.
+          // Continuing immediately after network failures usually burns turns
+          // without progress and can rapidly hit max-turn guards.
+          if (
+            feature('GOAL') &&
+            newMessage.type === 'assistant' &&
+            'isApiErrorMessage' in newMessage &&
+            newMessage.isApiErrorMessage
+          ) {
+            const assistantText =
+              getContentText((newMessage.message?.content ?? '') as string | ContentBlockParam[]) ?? '';
+            const lowerText = assistantText.toLowerCase();
+            const isConnectivityFailure =
+              lowerText.includes('connection error') ||
+              lowerText.includes('fetch failed') ||
+              lowerText.includes('network error') ||
+              lowerText.includes('enotfound') ||
+              lowerText.includes('econnreset') ||
+              lowerText.includes('etimedout');
+
+            if (isConnectivityFailure) {
+              const { getGoal, pauseGoal } =
+                require('../services/goal/goalState.js') as typeof import('../services/goal/goalState.js');
+              const { persistCurrentGoal } =
+                require('../services/goal/goalStorage.js') as typeof import('../services/goal/goalStorage.js');
+              const currentGoal = getGoal();
+              if (currentGoal?.status === 'active') {
+                pauseGoal();
+                persistCurrentGoal();
+                addNotification({
+                  key: 'goal-auto-paused-connectivity-error',
+                  text: 'Detected connection error. Active goal was auto-paused. Run /goal resume after network recovers.',
+                  priority: 'immediate',
+                });
+              }
             }
           }
           // Relay assistant response to master when in slave mode.
@@ -3510,6 +3660,7 @@ export function REPL({
 
       try {
         pipeReturnHadErrorRef.current = false;
+        setWasAborted(false);
         // isLoading is derived from queryGuard — tryStart() above already
         // transitioned dispatching→running, so no setter call needed here.
         resetTimingRefs();
@@ -3567,6 +3718,7 @@ export function REPL({
         // running→idle. Returns false if a newer query owns the guard
         // (cancel+resubmit race where the stale finally fires as a microtask).
         if (queryGuard.end(thisGeneration)) {
+          setWasAborted(abortController.signal.aborted);
           setLastQueryCompletionTime(Date.now());
           skipIdleCheckRef.current = false;
           // Always reset loading state in finally - this ensures cleanup even
@@ -3920,6 +4072,7 @@ export function REPL({
               doneOptions?: {
                 display?: CommandResultDisplay;
                 metaMessages?: string[];
+                displayArgs?: string;
               },
             ): void => {
               doneWasCalled = true;
@@ -3943,8 +4096,9 @@ export function REPL({
                 // doesn't change model context). Outside fullscreen the
                 // transcript entry stays so scrollback shows what ran.
                 if (!isFullscreenEnvEnabled()) {
+                  const breadcrumbArgs = doneOptions?.displayArgs ?? commandArgs;
                   newMessages.push(
-                    createCommandInputMessage(formatCommandInputTags(getCommandName(matchingCommand), commandArgs)),
+                    createCommandInputMessage(formatCommandInputTags(getCommandName(matchingCommand), breadcrumbArgs)),
                     createCommandInputMessage(
                       `<${LOCAL_COMMAND_STDOUT_TAG}>${escapeXml(result)}</${LOCAL_COMMAND_STDOUT_TAG}>`,
                     ),
@@ -4906,8 +5060,9 @@ export function REPL({
   const { relayPipeMessage, pipeReturnHadErrorRef } = usePipeRelay();
 
   // Voice input integration (VOICE_MODE builds only)
+  const voiceIntegrationResult = useVoiceIntegration({ setInputValueRaw, inputValueRef, insertTextRef });
   const voice = feature('VOICE_MODE')
-    ? useVoiceIntegration({ setInputValueRaw, inputValueRef, insertTextRef })
+    ? voiceIntegrationResult
     : {
         stripTrailing: () => 0,
         handleKeyEvent: () => {},
@@ -4925,7 +5080,7 @@ export function REPL({
   useMailboxBridge({ isLoading, onSubmitMessage: handleIncomingPrompt });
   useMasterMonitor();
   useSlaveNotifications();
-  const pipeIpcState = useAppState(s => getPipeIpc(s as any));
+  const _pipeIpcState = useAppState(s => getPipeIpc(s));
 
   usePipePermissionForward({ store, tools, setMessages, setToolUseConfirmQueue, getToolUseContext, mainLoopModel });
   usePipeMuteSync({ setToolUseConfirmQueue });
@@ -4972,6 +5127,34 @@ export function REPL({
     hasActiveLocalJsxUI: isShowingLocalJSXCommand,
     isInPlanMode: toolPermissionContext.mode === 'plan',
     onQueueTick: (command: QueuedCommand) => enqueue(command),
+  });
+
+  // Goal auto-continuation: enqueue a steering prompt when idle + active goal
+  // eslint-disable-next-line react-hooks/rules-of-hooks
+  useGoalContinuation?.({
+    isLoading: isLoading || initialMessage !== null,
+    wasAborted,
+    queuedCommandsLength: queuedCommands.length,
+    hasActiveLocalJsxUI: isShowingLocalJSXCommand,
+    isInPlanMode: toolPermissionContext.mode === 'plan',
+    isQueryActiveNow: queryGuard.getSnapshot,
+    onContinuationEnqueued: ({ turn, objective }) => {
+      const visibleGoalTurnInput = `Goal auto-continue (${turn}/1): continue advancing "${objective}".`;
+      setMessages(oldMessages => [
+        ...oldMessages,
+        createUserMessage({
+          content: visibleGoalTurnInput,
+          isVisibleInTranscriptOnly: true,
+        }),
+      ]);
+    },
+    onMaxTurnsReached: () => {
+      addNotification({
+        key: 'goal-max-turns-reached',
+        text: 'Goal reached max continuation turns (1). Run /goal continue to reset turn counter and continue.',
+        priority: 'immediate',
+      });
+    },
   });
 
   useEffect(() => {
@@ -5344,6 +5527,93 @@ export function REPL({
   // Auto-exit viewing mode when teammate completes or errors
   useTeammateViewAutoExit();
 
+  // Get viewed agent task (inlined from selectors for explicit data flow).
+  // viewedAgentTask: teammate OR local_agent — drives the boolean checks
+  // below. viewedTeammateTask: teammate-only narrowed, for teammate-specific
+  // field access (inProgressToolUseIDs).
+  const viewedTask = viewingAgentTaskId ? tasks[viewingAgentTaskId] : undefined;
+  const viewedTeammateTask = viewedTask && isInProcessTeammateTask(viewedTask) ? viewedTask : undefined;
+  const viewedAgentTask = viewedTeammateTask ?? (viewedTask && isLocalAgentTask(viewedTask) ? viewedTask : undefined);
+
+  // Bypass useDeferredValue when streaming text is showing so Messages renders
+  // the final message in the same frame streaming text clears. Also bypass when
+  // not loading — deferredMessages only matters during streaming (keeps input
+  // responsive); after the turn ends, showing messages immediately prevents a
+  // jitter gap where the spinner is gone but the answer hasn't appeared yet.
+  // Only reducedMotion users keep the deferred path during loading.
+  const usesSyncMessages = showStreamingText || !isLoading;
+  // When viewing an agent, never fall through to leader — empty until
+  // bootstrap/stream fills. Closes the see-leader-type-agent footgun.
+  const rawAgentMessages = viewedAgentTask?.messages;
+  // Fork sidechain encodes the user prompt inside a mixed user message alongside
+  // tool_result blocks; surface the prompt as a standalone bubble and strip the
+  // boilerplate text from its original carrier while preserving tool_results.
+  const displayedAgentMessages = useMemo(() => {
+    if (!viewedAgentTask) return undefined;
+    const agentMessages = rawAgentMessages ?? [];
+    if (
+      !isLocalAgentTask(viewedAgentTask) ||
+      viewedAgentTask.agentType !== FORK_SUBAGENT_TYPE ||
+      !viewedAgentTask.prompt
+    ) {
+      return agentMessages;
+    }
+    // Single pass: locate boilerplate carrier, check whether the prompt text is
+    // already present elsewhere, and find the fallback insertion point (after
+    // the last parent assistant tool_use).
+    const trimmedPrompt = viewedAgentTask.prompt.trim();
+    let boilerplateIndex = -1;
+    let lastAssistantToolUseIndex = -1;
+    let promptAlreadyRendered = false;
+    for (let i = 0; i < agentMessages.length; i++) {
+      const m = agentMessages[i]!;
+      if (m.type === 'user' && Array.isArray(m.message?.content)) {
+        const hasBoilerplate = m.message.content.some(isForkBoilerplateTextBlock);
+        if (hasBoilerplate) {
+          boilerplateIndex = i;
+        } else if (!promptAlreadyRendered) {
+          const firstText = m.message.content.find(b => b.type === 'text' && typeof b.text === 'string') as
+            | { type: 'text'; text: string }
+            | undefined;
+          if (firstText && firstText.text.trim() === trimmedPrompt) promptAlreadyRendered = true;
+        }
+        continue;
+      }
+      if (m.type === 'assistant' && Array.isArray(m.message?.content)) {
+        if (m.message.content.some(b => b.type === 'tool_use')) lastAssistantToolUseIndex = i;
+      }
+    }
+
+    const stripped =
+      boilerplateIndex === -1
+        ? agentMessages
+        : agentMessages.map((m, i) => {
+            if (i !== boilerplateIndex) return m;
+            if (!Array.isArray(m.message?.content)) return m;
+            return {
+              ...m,
+              message: {
+                ...m.message,
+                content: m.message.content.filter(b => !isForkBoilerplateTextBlock(b)),
+              },
+            };
+          });
+
+    if (promptAlreadyRendered) return stripped;
+
+    const insertAt = boilerplateIndex !== -1 ? boilerplateIndex + 1 : lastAssistantToolUseIndex + 1;
+    const synthetic = createUserMessage({
+      content: viewedAgentTask.prompt,
+      timestamp: new Date(viewedAgentTask.startTime).toISOString(),
+    });
+    return [...stripped.slice(0, insertAt), synthetic, ...stripped.slice(insertAt)];
+  }, [viewedAgentTask, rawAgentMessages]);
+  const displayedMessages = viewedAgentTask
+    ? (displayedAgentMessages ?? [])
+    : usesSyncMessages
+      ? messages
+      : deferredMessages;
+
   if (screen === 'transcript') {
     // Virtual scroll replaces the 30-message cap: everything is scrollable
     // and memory is bounded by the viewport. Without it, wrapping transcript
@@ -5519,28 +5789,6 @@ export function REPL({
     return transcriptReturn;
   }
 
-  // Get viewed agent task (inlined from selectors for explicit data flow).
-  // viewedAgentTask: teammate OR local_agent — drives the boolean checks
-  // below. viewedTeammateTask: teammate-only narrowed, for teammate-specific
-  // field access (inProgressToolUseIDs).
-  const viewedTask = viewingAgentTaskId ? tasks[viewingAgentTaskId] : undefined;
-  const viewedTeammateTask = viewedTask && isInProcessTeammateTask(viewedTask) ? viewedTask : undefined;
-  const viewedAgentTask = viewedTeammateTask ?? (viewedTask && isLocalAgentTask(viewedTask) ? viewedTask : undefined);
-
-  // Bypass useDeferredValue when streaming text is showing so Messages renders
-  // the final message in the same frame streaming text clears. Also bypass when
-  // not loading — deferredMessages only matters during streaming (keeps input
-  // responsive); after the turn ends, showing messages immediately prevents a
-  // jitter gap where the spinner is gone but the answer hasn't appeared yet.
-  // Only reducedMotion users keep the deferred path during loading.
-  const usesSyncMessages = showStreamingText || !isLoading;
-  // When viewing an agent, never fall through to leader — empty until
-  // bootstrap/stream fills. Closes the see-leader-type-agent footgun.
-  const displayedMessages = viewedAgentTask
-    ? (viewedAgentTask.messages ?? [])
-    : usesSyncMessages
-      ? messages
-      : deferredMessages;
   // Show the placeholder until the real user message appears in
   // displayedMessages. userInputOnProcessing stays set for the whole turn
   // (cleared in resetLoadingState); this length check hides it once
@@ -5708,6 +5956,7 @@ export function REPL({
                   spinnerTip={spinnerTip}
                   responseLengthRef={responseLengthRef}
                   apiMetricsRef={apiMetricsRef}
+                  compactProgressActiveRef={compactProgressActiveRef}
                   overrideMessage={spinnerMessage}
                   spinnerSuffix={stopHookSpinnerSuffix}
                   verbose={verbose}
@@ -5726,7 +5975,6 @@ export function REPL({
                 !hasRunningTeammates &&
                 isBriefOnly &&
                 !viewedAgentTask && <BriefIdleStatus />}
-              {isFullscreenEnvEnabled() && <PromptInputQueuedCommands />}
             </>
           }
           bottom={
@@ -5739,6 +5987,7 @@ export function REPL({
                 <CompanionSprite />
               ) : null}
               <Box flexDirection="column" flexGrow={1}>
+                {isFullscreenEnvEnabled() && <PromptInputQueuedCommands />}
                 {permissionStickyFooter}
                 {/* Immediate local-jsx commands (/btw, /sandbox, /assistant,
                   /issue) render here, NOT inside scrollable. They stay mounted
@@ -6074,6 +6323,14 @@ export function REPL({
                   />
                 )}
 
+                {focusedInputDialog === 'search-extra-tools-hint' && searchExtraToolsHint.visible && (
+                  <SearchExtraToolsHint
+                    tools={searchExtraToolsHint.tools}
+                    onSelect={searchExtraToolsHint.handleSelect}
+                    onDismiss={searchExtraToolsHint.handleDismiss}
+                  />
+                )}
+
                 {focusedInputDialog === 'lsp-recommendation' && lspRecommendation && (
                   <LspRecommendationMenu
                     pluginName={lspRecommendation.pluginName}
@@ -6274,6 +6531,7 @@ export function REPL({
                       voiceInterimRange={voice.interimRange}
                     />
                     <SessionBackgroundHint onBackgroundSession={handleBackgroundSession} isLoading={isLoading} />
+                    <BackgroundAgentSelector />
                   </>
                 )}
                 {cursor && (

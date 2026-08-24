@@ -18,7 +18,10 @@ import type {
   NormalizedUserMessage,
 } from '../types/message.js'
 import { PERMISSION_MODES } from '../types/permissions.js'
-import { suppressNextSkillDiscovery, suppressNextSkillListing } from './attachments.js'
+import {
+  suppressNextSkillDiscovery,
+  suppressNextSkillListing,
+} from './attachments.js'
 import {
   copyFileHistoryForResume,
   type FileHistorySnapshot,
@@ -320,7 +323,10 @@ function detectTurnInterruption(
       return { kind: 'interrupted_turn' }
     }
     // Plain text user prompt — CC hadn't started responding
-    return { kind: 'interrupted_prompt', message: lastMessage as NormalizedUserMessage }
+    return {
+      kind: 'interrupted_prompt',
+      message: lastMessage as NormalizedUserMessage,
+    }
   }
 
   if (lastMessage.type === 'attachment') {
@@ -362,7 +368,13 @@ function isTerminalToolResult(
     const msgContent = msg.message!.content
     if (!Array.isArray(msgContent)) continue
     for (const b of msgContent) {
-      if (typeof b !== 'string' && 'type' in b && b.type === 'tool_use' && 'id' in b && b.id === toolUseId) {
+      if (
+        typeof b !== 'string' &&
+        'type' in b &&
+        b.type === 'tool_use' &&
+        'id' in b &&
+        b.id === toolUseId
+      ) {
         return (
           ('name' in b ? b.name : undefined) === BRIEF_TOOL_NAME ||
           ('name' in b ? b.name : undefined) === LEGACY_BRIEF_TOOL_NAME ||
@@ -387,7 +399,11 @@ export function restoreSkillStateFromMessages(messages: Message[]): void {
       continue
     }
     if (message.attachment!.type === 'invoked_skills') {
-      const skills = message.attachment!.skills as Array<{ name?: string; path?: string; content?: string }>;
+      const skills = message.attachment!.skills as Array<{
+        name?: string
+        path?: string
+        content?: string
+      }>
       for (const skill of skills) {
         if (skill.name && skill.path && skill.content) {
           // Resume only happens for the main session, so agentId is null
@@ -491,6 +507,8 @@ export async function loadConversationForResume(
   prRepository?: string
   // Full path to the session file (for cross-directory resume)
   fullPath?: string
+  // Goal state for hydration on resume
+  goal?: import('../types/logs.js').GoalState
 } | null> {
   try {
     let log: LogOption | null = null
@@ -602,6 +620,8 @@ export async function loadConversationForResume(
       prRepository: log?.prRepository,
       // Include full path for cross-directory resume
       fullPath: log?.fullPath,
+      // Goal state for hydration on resume
+      goal: log?.goal,
     }
   } catch (error) {
     logError(error as Error)

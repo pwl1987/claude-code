@@ -26,6 +26,7 @@ const COMMAND_SUBSTITUTION_PATTERNS = [
     message: 'Zsh equals expansion (=cmd)',
   },
   { pattern: /\$\(/, message: '$() command substitution' },
+  // biome-ignore lint/suspicious/noTemplateCurlyInString: describing shell syntax, not a template literal
   { pattern: /\$\{/, message: '${} parameter substitution' },
   { pattern: /\$\[/, message: '$[] legacy arithmetic expansion' },
   { pattern: /~\[/, message: 'Zsh-style parameter expansion' },
@@ -576,11 +577,6 @@ export function stripSafeHeredocSubstitutions(command: string): string | null {
     result = result.slice(0, r.start) + result.slice(r.end)
   }
   return result
-}
-
-/** Detection-only check: does the command contain a safe heredoc substitution? */
-export function hasSafeHeredocSubstitution(command: string): boolean {
-  return stripSafeHeredocSubstitutions(command) !== null
 }
 
 function validateSafeCommandSubstitution(
@@ -1574,7 +1570,6 @@ function hasBackslashEscapedWhitespace(command: string): boolean {
 
     if (char === "'" && !inDoubleQuote) {
       inSingleQuote = !inSingleQuote
-      continue
     }
   }
 
@@ -1687,7 +1682,6 @@ function hasBackslashEscapedOperator(command: string): boolean {
     }
     if (char === '"' && !inSingleQuote) {
       inDoubleQuote = !inDoubleQuote
-      continue
     }
   }
 
@@ -2258,8 +2252,7 @@ function validateZshDangerousCommands(
  * itself. Normal path validation (validatePath) cannot catch them because
  * the files don't exist on disk.
  */
-const NETWORK_DEVICE_PATH_RE =
-  /\/dev\/(tcp|udp)\/[^/\s"'`$]+\/\d+/i
+const NETWORK_DEVICE_PATH_RE = /\/dev\/(tcp|udp)\/[^/\s"'`$]+\/\d+/i
 
 function validateNetworkDeviceRedirect(
   context: ValidationContext,
@@ -2289,6 +2282,7 @@ function validateNetworkDeviceRedirect(
 // so an attacker can use them to slip metacharacters past our checks while
 // bash still executes them (e.g., "echo safe\x00; rm -rf /").
 // eslint-disable-next-line no-control-regex
+// biome-ignore lint/suspicious/noControlCharactersInRegex: intentional control character matching for security validation
 const CONTROL_CHAR_RE = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/
 
 /**

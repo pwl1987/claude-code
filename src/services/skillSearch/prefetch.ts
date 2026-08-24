@@ -267,7 +267,8 @@ export async function startSkillDiscoveryPrefetch(
     const newResults = results.filter(r => !discoveredThisSession.has(r.name))
     if (newResults.length === 0) return []
 
-    for (const r of newResults) addBoundedSessionEntry(discoveredThisSession, r.name)
+    for (const r of newResults)
+      addBoundedSessionEntry(discoveredThisSession, r.name)
 
     const signal: DiscoverySignal = {
       trigger: 'assistant_turn',
@@ -306,7 +307,7 @@ export async function collectSkillDiscoveryPrefetch(
 
 export async function getTurnZeroSkillDiscovery(
   input: string,
-  messages: Message[],
+  _messages: Message[],
   context: ToolUseContext,
 ): Promise<Attachment | null> {
   if (!isSkillSearchEnabled()) return null
@@ -331,7 +332,8 @@ export async function getTurnZeroSkillDiscovery(
 
     if (results.length === 0 && !gap) return null
 
-    for (const r of results) addBoundedSessionEntry(discoveredThisSession, r.name)
+    for (const r of results)
+      addBoundedSessionEntry(discoveredThisSession, r.name)
 
     const signal: DiscoverySignal = {
       trigger: 'user_input',

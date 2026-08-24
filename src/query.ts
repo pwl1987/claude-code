@@ -7,6 +7,8 @@ import type { CanUseToolFn } from './hooks/useCanUseTool.js'
 import { FallbackTriggeredError } from './services/api/withRetry.js'
 import {
   calculateTokenWarningState,
+  estimateMaxTurnGrowth,
+  getEffectiveContextWindowSize,
   isAutoCompactEnabled,
   type AutoCompactTrackingState,
 } from './services/compact/autoCompact.js'
@@ -66,7 +68,10 @@ import {
 const skillPrefetch = feature('EXPERIMENTAL_SKILL_SEARCH')
   ? (require('./services/skillSearch/prefetch.js') as typeof import('./services/skillSearch/prefetch.js'))
   : null
-const jobClassifier = feature('TEMPLATES')
+const searchExtraToolsPrefetch = feature('EXPERIMENTAL_SEARCH_EXTRA_TOOLS')
+  ? (require('./services/searchExtraTools/prefetch.js') as typeof import('./services/searchExtraTools/prefetch.js'))
+  : null
+const _jobClassifier = feature('TEMPLATES')
   ? (require('./jobs/classifier.js') as typeof import('./jobs/classifier.js'))
   : null
 /* eslint-enable @typescript-eslint/no-require-imports */
@@ -121,9 +126,16 @@ import { count } from './utils/array.js'
 import {
   createTrace,
   endTrace,
+  flushLangfuse,
   isLangfuseEnabled,
 } from './services/langfuse/index.js'
 import { getAPIProvider } from './utils/model/providers.js'
+import {
+  createCacheWarningMessage,
+  getCacheThreshold,
+  isCacheWarningEnabled,
+  shouldShowCacheWarning,
+} from './utils/cacheWarning.js'
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 const snipModule = feature('HISTORY_SNIP')
@@ -336,6 +348,35 @@ export async function* query(
         terminal?.reason === 'aborted_streaming' ||
         terminal?.reason === 'aborted_tools'
       endTrace(langfuseTrace, undefined, isAborted ? 'interrupted' : undefined)
+      // Flush the processor to release span data (including serialized
+      // conversation history stored as langfuse.observation.input). Without
+      // this, SpanImpl objects retain hundreds of KB of JSON until the
+      // processor's batch timer fires (default 10s).
+      await flushLangfuse()
+    }
+
+    // Break the closure chain: toolUseContext captures langfuseTrace which
+    // holds SpanImpl → otperformance (the 571MB Performance object). Nulling
+    // these after endTrace allows GC to reclaim the span tree.
+    if (paramsWithTrace !== params) {
+      paramsWithTrace.toolUseContext.langfuseTrace = null
+      paramsWithTrace.toolUseContext.langfuseRootTrace = null
+      paramsWithTrace.toolUseContext.langfuseBatchSpan = null
+    }
+
+    // Clear JSC's native Performance buffers. OTel (otperformance) references
+    // globalThis.performance which stores marks/measures/resource timings in a
+    // C++ Vector that never shrinks. Long-running sessions accumulate hundreds
+    // of MB of dead capacity even after spans are flushed and nullified.
+    const gPerf = globalThis.performance
+    if (gPerf && typeof gPerf.clearMarks === 'function') {
+      try {
+        gPerf.clearMarks()
+        gPerf.clearMeasures?.()
+        gPerf.clearResourceTimings?.()
+      } catch {
+        // Non-critical — some environments may not support all methods
+      }
     }
   }
 
@@ -445,6 +486,11 @@ async function* queryLoop(
       messages,
       toolUseContext,
     )
+    const pendingToolPrefetch =
+      searchExtraToolsPrefetch?.startSearchExtraToolsPrefetch(
+        toolUseContext.options.tools ?? [],
+        messages,
+      )
 
     yield { type: 'stream_request_start' }
 
@@ -474,7 +520,37 @@ async function* queryLoop(
       queryTracking,
     }
 
-    let messagesForQuery = [...getMessagesAfterCompactBoundary(messages)]
+    let messagesForQuery = getMessagesAfterCompactBoundary(messages)
+
+    // Release toolUseResult payloads from previous turns — the next API call
+    // only needs message.message.content (tool_result blocks), not the raw
+    // output object. This prevents unbounded memory growth in long sessions
+    // before compact triggers (a single FileRead of a 400KB file would
+    // otherwise stay in mutableMessages forever).
+    //
+    // IMPORTANT: shallow-copy rather than mutate. messagesForQuery elements
+    // are references shared with mutableMessages (UI state); deleting
+    // toolUseResult in place strips it from the live message while React may
+    // still be rendering it. The next query can start within milliseconds of
+    // tool_result creation (model immediately calls the next tool), before
+    // the UI commit lands — UserToolSuccessMessage reads
+    // message.toolUseResult to delegate to tool.renderToolResultMessage, so a
+    // mutation race makes tool-result rows render blank. Map to a stripped
+    // copy so mutableMessages keeps the original for the UI; downstream API
+    // transformations (applyToolResultBudget, snip, microcompact) already
+    // build new arrays via .map(), so they compose cleanly with this copy.
+    messagesForQuery = messagesForQuery.map(msg => {
+      if (
+        msg.type !== 'user' ||
+        !('toolUseResult' in msg) ||
+        (msg as { toolUseResult?: unknown }).toolUseResult === undefined
+      ) {
+        return msg
+      }
+      const copy: typeof msg = { ...msg }
+      delete (copy as Message & { toolUseResult?: unknown }).toolUseResult
+      return copy
+    })
 
     let tracking = autoCompactTracking
 
@@ -529,6 +605,16 @@ async function* queryLoop(
       querySource,
     )
     messagesForQuery = microcompactResult.messages
+    // Release original strings from contentReplacementState.replacements for
+    // tool results whose content was replaced with the cleared message.
+    if (microcompactResult.clearedToolUseIds?.length) {
+      const replacements = toolUseContext?.contentReplacementState?.replacements
+      if (replacements) {
+        for (const id of microcompactResult.clearedToolUseIds) {
+          replacements.delete(id)
+        }
+      }
+    }
     // For cached microcompact (cache editing), defer boundary message until after
     // the API response so we can use actual cache_deleted_input_tokens.
     // Gated behind feature() so the string is eliminated from external builds.
@@ -756,6 +842,48 @@ async function* queryLoop(
           error: 'invalid_request',
         })
         return { reason: 'blocking_limit' }
+      }
+    }
+
+    // Predictive autocompact: estimate if this turn's growth will push
+    // us past the context window. Uses effectiveContextWindow directly
+    // (without the autocompact buffer) to avoid double-reserving with
+    // getAutoCompactThreshold which already subtracts buffer.
+    if (!compactionResult && isAutoCompactEnabled()) {
+      const model = toolUseContext.options.mainLoopModel
+      const currentTokens =
+        tokenCountWithEstimation(messagesForQuery) - snipTokensFreed
+      const estimatedGrowth = estimateMaxTurnGrowth(model)
+      const predictiveThreshold =
+        getEffectiveContextWindowSize(model) - estimatedGrowth
+      if (currentTokens > predictiveThreshold) {
+        const predictiveResult = await deps.autocompact(
+          messagesForQuery,
+          toolUseContext,
+          {
+            systemPrompt,
+            userContext,
+            systemContext,
+            toolUseContext,
+            forkContextMessages: messagesForQuery,
+          },
+          querySource,
+          tracking,
+          snipTokensFreed,
+        )
+        if (predictiveResult.compactionResult) {
+          messagesForQuery = buildPostCompactMessages(
+            predictiveResult.compactionResult,
+          )
+          snipTokensFreed = 0
+          tracking = tracking
+            ? {
+                ...tracking,
+                compacted: true,
+                consecutiveFailures: predictiveResult.consecutiveFailures ?? 0,
+              }
+            : tracking
+        }
       }
     }
 
@@ -1129,10 +1257,36 @@ async function* queryLoop(
       return { reason: 'model_error', error }
     }
 
+    // 检测缓存命中率并在需要时 yield 警告消息
+    // 必须在 executePostSamplingHooks 之前执行，确保警告消息在工具结果之前显示
+    if (
+      assistantMessages.length > 0 &&
+      !toolUseContext.options.isNonInteractiveSession
+    ) {
+      const lastAssistant = assistantMessages.at(-1)
+      const usage = lastAssistant?.message?.usage as
+        | {
+            input_tokens: number
+            cache_creation_input_tokens: number
+            cache_read_input_tokens: number
+          }
+        | undefined
+      if (usage && isCacheWarningEnabled()) {
+        const warningInfo = shouldShowCacheWarning(
+          usage,
+          querySource,
+          getCacheThreshold(),
+        )
+        if (warningInfo) {
+          yield createCacheWarningMessage(warningInfo)
+        }
+      }
+    }
+
     // Execute post-sampling hooks after model response is complete
     if (assistantMessages.length > 0) {
       void executePostSamplingHooks(
-        [...messagesForQuery, ...assistantMessages],
+        messagesForQuery.concat(assistantMessages),
         systemPrompt,
         userContext,
         systemContext,
@@ -1742,7 +1896,7 @@ async function* queryLoop(
       updatedToolUseContext,
       null,
       queuedAutonomyClaim.attachmentCommands,
-      [...messagesForQuery, ...assistantMessages, ...toolResults],
+      messagesForQuery.concat(assistantMessages, toolResults),
       querySource,
     )) {
       yield attachment
@@ -1780,6 +1934,19 @@ async function* queryLoop(
       const skillAttachments =
         await skillPrefetch.collectSkillDiscoveryPrefetch(pendingSkillPrefetch)
       for (const att of skillAttachments) {
+        const msg = createAttachmentMessage(att)
+        yield msg
+        toolResults.push(msg)
+      }
+    }
+
+    // Inject prefetched tool discovery.
+    if (searchExtraToolsPrefetch && pendingToolPrefetch) {
+      const toolAttachments =
+        await searchExtraToolsPrefetch.collectSearchExtraToolsPrefetch(
+          pendingToolPrefetch,
+        )
+      for (const att of toolAttachments) {
         const msg = createAttachmentMessage(att)
         yield msg
         toolResults.push(msg)
@@ -1854,11 +2021,10 @@ async function* queryLoop(
           userContext,
           systemContext,
           toolUseContext,
-          forkContextMessages: [
-            ...messagesForQuery,
-            ...assistantMessages,
-            ...toolResults,
-          ],
+          forkContextMessages: messagesForQuery.concat(
+            assistantMessages,
+            toolResults,
+          ),
         })
       }
     }
@@ -1875,7 +2041,7 @@ async function* queryLoop(
 
     queryCheckpoint('query_recursive_call')
     const next: State = {
-      messages: [...messagesForQuery, ...assistantMessages, ...toolResults],
+      messages: messagesForQuery.concat(assistantMessages, toolResults),
       toolUseContext: toolUseContextWithQueryTracking,
       autoCompactTracking: tracking,
       turnCount: nextTurnCount,

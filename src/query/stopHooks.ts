@@ -39,9 +39,6 @@ import { getTaskListId, listTasks } from '../utils/tasks.js'
 import { getAgentName, getTeamName, isTeammate } from '../utils/teammate.js'
 
 /* eslint-disable @typescript-eslint/no-require-imports */
-const extractMemoriesModule = feature('EXTRACT_MEMORIES')
-  ? (require('../services/extractMemories/extractMemories.js') as typeof import('../services/extractMemories/extractMemories.js'))
-  : null
 const jobClassifierModule = feature('TEMPLATES')
   ? (require('../jobs/classifier.js') as typeof import('../jobs/classifier.js'))
   : null
@@ -52,10 +49,8 @@ import type { QuerySource } from '../constants/querySource.js'
 import { executeAutoDream } from '../services/autoDream/autoDream.js'
 import { executePromptSuggestion } from '../services/PromptSuggestion/promptSuggestion.js'
 import { isBareMode, isEnvDefinedFalsy } from '../utils/envUtils.js'
-import {
-  createCacheSafeParams,
-  saveCacheSafeParams,
-} from '../utils/forkedAgent.js'
+import { saveCacheSafeParams } from '../utils/cacheSafeParamsSlot.js'
+import { createCacheSafeParams } from '../utils/forkedAgent.js'
 
 type StopHookResult = {
   blockingErrors: Message[]
@@ -154,10 +149,16 @@ export async function* handleStopHooks(
       // Fire-and-forget in both interactive and non-interactive. For -p/SDK,
       // print.ts drains the in-flight promise after flushing the response
       // but before gracefulShutdownSync (see drainPendingExtraction).
-      void extractMemoriesModule!.executeExtractMemories(
-        stopHookContext,
-        toolUseContext.appendSystemMessage as ((msg: import('../types/message.js').SystemMessage) => void) | undefined,
-      )
+      void import('../services/extractMemories/extractMemories.js')
+        .then(({ executeExtractMemories }) =>
+          executeExtractMemories(
+            stopHookContext,
+            toolUseContext.appendSystemMessage as
+              | ((msg: import('../types/message.js').SystemMessage) => void)
+              | undefined,
+          ),
+        )
+        .catch(() => {})
     }
     if (!toolUseContext.agentId && !poorMode) {
       void executeAutoDream(stopHookContext, toolUseContext.appendSystemMessage)
@@ -231,7 +232,8 @@ export async function* handleStopHooks(
           ) {
             if (attachment.type === 'hook_non_blocking_error') {
               hookErrors.push(
-                (attachment.stderr as string) || `Exit code ${attachment.exitCode}`,
+                (attachment.stderr as string) ||
+                  `Exit code ${attachment.exitCode}`,
               )
               // Non-blocking errors always have output
               hasOutput = true
